@@ -1,5 +1,5 @@
 %%%-------------------------------------------------------------------
-%%% @copyright (C) 2013, VoIP INC
+%%% @copyright (C) 2013-2014, 2600Hz INC
 %%% @doc
 %%% Handles reading/writing to the buckets ETS table
 %%% @end
