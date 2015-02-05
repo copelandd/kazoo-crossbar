@@ -6,7 +6,7 @@
 %%% @contributors
 %%%   James Aimonetti
 %%%-------------------------------------------------------------------
--module(cb_limits).
+-module(cb_limits_v1).
 
 -export([init/0
          ,allowed_methods/0
@@ -26,12 +26,12 @@
 %%% API
 %%%===================================================================
 init() ->
-    _ = crossbar_bindings:bind(<<"*.allowed_methods.limits">>, ?MODULE, 'allowed_methods'),
-    _ = crossbar_bindings:bind(<<"*.resource_exists.limits">>, ?MODULE, 'resource_exists'),
-    _ = crossbar_bindings:bind(<<"*.billing">>, ?MODULE, 'billing'),
-    _ = crossbar_bindings:bind(<<"*.validate.limits">>, ?MODULE, 'validate'),
-    _ = crossbar_bindings:bind(<<"*.execute.post.limits">>, ?MODULE, 'post'),
-    crossbar_bindings:bind(<<"*.finish_request.*.limits">>, 'cb_modules_util', 'reconcile_services').
+    _ = crossbar_bindings:bind(<<"v1_resource.allowed_methods.limits">>, ?MODULE, 'allowed_methods'),
+    _ = crossbar_bindings:bind(<<"v1_resource.resource_exists.limits">>, ?MODULE, 'resource_exists'),
+    _ = crossbar_bindings:bind(<<"v1_resource.billing">>, ?MODULE, 'billing'),
+    _ = crossbar_bindings:bind(<<"v1_resource.validate.limits">>, ?MODULE, 'validate'),
+    _ = crossbar_bindings:bind(<<"v1_resource.execute.post.limits">>, ?MODULE, 'post'),
+    crossbar_bindings:bind(<<"v1_resource.finish_request.*.limits">>, 'cb_modules_util', 'reconcile_services').
 
 %%--------------------------------------------------------------------
 %% @public
@@ -74,10 +74,7 @@ process_billing(Context, [{<<"limits">>, _}|_], ?HTTP_GET) ->
     Context;
 process_billing(Context, [{<<"limits">>, _}|_], _Verb) ->
     AccountId = cb_context:account_id(Context),
-    AuthAccountId = cb_context:auth_account_id(Context),
-    try wh_services:allow_updates(AccountId)
-             andalso authd_account_allowed_updates(AccountId, AuthAccountId)
-    of
+    try wh_services:allow_updates(AccountId) andalso is_allowed(Context) of
         'true' -> Context;
         'false' ->
             Message = <<"Please contact your phone provider to add limits.">>,
@@ -88,8 +85,11 @@ process_billing(Context, [{<<"limits">>, _}|_], _Verb) ->
     end;
 process_billing(Context, _Nouns, _Verb) -> Context.
 
--spec authd_account_allowed_updates(ne_binary(), ne_binary()) -> boolean().
-authd_account_allowed_updates(AccountId, AuthAccountId) ->
+-spec is_allowed(cb_context:context()) -> boolean().
+is_allowed(Context) ->
+    AccountId = cb_context:account_id(Context),
+    AuthAccountId = cb_context:auth_account_id(Context),
+    IsSystemAdmin = wh_util:is_system_admin(AuthAccountId),
     {'ok', MasterAccount} = whapps_util:get_master_account_id(),
     case wh_services:find_reseller_id(AccountId) of
         AuthAccountId ->
@@ -97,6 +97,9 @@ authd_account_allowed_updates(AccountId, AuthAccountId) ->
             'true';
         MasterAccount ->
             lager:debug("allowing direct account to update limits"),
+            'true';
+        _Else when IsSystemAdmin ->
+            lager:debug("allowing system admin to update limits"),
             'true';
         _Else ->
             lager:debug("sub-accounts of non-master resellers must contact the reseller to change their limits"),
@@ -116,6 +119,7 @@ authd_account_allowed_updates(AccountId, AuthAccountId) ->
 validate(Context) ->
     validate_limits(Context, cb_context:req_verb(Context)).
 
+-spec validate_limits(cb_context:context(), http_method()) -> cb_context:context().
 validate_limits(Context, ?HTTP_GET) ->
     load_limit(Context);
 validate_limits(Context, ?HTTP_POST) ->
