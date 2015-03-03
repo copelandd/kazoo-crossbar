@@ -6,7 +6,7 @@
 %%% @contributors
 %%%   James Aimonetti
 %%%-------------------------------------------------------------------
--module(cb_limits).
+-module(cb_limits_v2).
 
 -export([init/0
          ,allowed_methods/0
@@ -26,12 +26,12 @@
 %%% API
 %%%===================================================================
 init() ->
-    _ = crossbar_bindings:bind(<<"*.allowed_methods.limits">>, ?MODULE, 'allowed_methods'),
-    _ = crossbar_bindings:bind(<<"*.resource_exists.limits">>, ?MODULE, 'resource_exists'),
-    _ = crossbar_bindings:bind(<<"*.billing">>, ?MODULE, 'billing'),
-    _ = crossbar_bindings:bind(<<"*.validate.limits">>, ?MODULE, 'validate'),
-    _ = crossbar_bindings:bind(<<"*.execute.post.limits">>, ?MODULE, 'post'),
-    crossbar_bindings:bind(<<"*.finish_request.*.limits">>, 'cb_modules_util', 'reconcile_services').
+    _ = crossbar_bindings:bind(<<"v2_resource.allowed_methods.limits">>, ?MODULE, 'allowed_methods'),
+    _ = crossbar_bindings:bind(<<"v2_resource.resource_exists.limits">>, ?MODULE, 'resource_exists'),
+    _ = crossbar_bindings:bind(<<"v2_resource.billing">>, ?MODULE, 'billing'),
+    _ = crossbar_bindings:bind(<<"v2_resource.validate.limits">>, ?MODULE, 'validate'),
+    _ = crossbar_bindings:bind(<<"v2_resource.execute.post.limits">>, ?MODULE, 'post'),
+    crossbar_bindings:bind(<<"v2_resource.finish_request.*.limits">>, 'cb_modules_util', 'reconcile_services').
 
 %%--------------------------------------------------------------------
 %% @public
@@ -74,22 +74,26 @@ process_billing(Context, [{<<"limits">>, _}|_], ?HTTP_GET) ->
     Context;
 process_billing(Context, [{<<"limits">>, _}|_], _Verb) ->
     AccountId = cb_context:account_id(Context),
-    AuthAccountId = cb_context:auth_account_id(Context),
-    try wh_services:allow_updates(AccountId)
-             andalso authd_account_allowed_updates(AccountId, AuthAccountId)
-    of
+    try wh_services:allow_updates(AccountId) andalso is_allowed(Context) of
         'true' -> Context;
         'false' ->
             Message = <<"Please contact your phone provider to add limits.">>,
-            cb_context:add_system_error('forbidden', [{'details', Message}], Context)
+            cb_context:add_system_error(
+                'forbidden'
+                ,wh_json:from_list([{<<"message">>, Message}])
+                ,Context
+            )
     catch
         'throw':{Error, Reason} ->
             crossbar_util:response('error', wh_util:to_binary(Error), 500, Reason, Context)
     end;
 process_billing(Context, _Nouns, _Verb) -> Context.
 
--spec authd_account_allowed_updates(ne_binary(), ne_binary()) -> boolean().
-authd_account_allowed_updates(AccountId, AuthAccountId) ->
+-spec is_allowed(cb_context:context()) -> boolean().
+is_allowed(Context) ->
+    AccountId = cb_context:account_id(Context),
+    AuthAccountId = cb_context:auth_account_id(Context),
+    IsSystemAdmin = wh_util:is_system_admin(AuthAccountId),
     {'ok', MasterAccount} = whapps_util:get_master_account_id(),
     case wh_services:find_reseller_id(AccountId) of
         AuthAccountId ->
@@ -97,6 +101,9 @@ authd_account_allowed_updates(AccountId, AuthAccountId) ->
             'true';
         MasterAccount ->
             lager:debug("allowing direct account to update limits"),
+            'true';
+        _Else when IsSystemAdmin ->
+            lager:debug("allowing system admin to update limits"),
             'true';
         _Else ->
             lager:debug("sub-accounts of non-master resellers must contact the reseller to change their limits"),
@@ -116,13 +123,15 @@ authd_account_allowed_updates(AccountId, AuthAccountId) ->
 validate(Context) ->
     validate_limits(Context, cb_context:req_verb(Context)).
 
+-spec validate_limits(cb_context:context(), http_method()) -> cb_context:context().
 validate_limits(Context, ?HTTP_GET) ->
     load_limit(Context);
 validate_limits(Context, ?HTTP_POST) ->
-    update_limits(Context).
+    cb_context:validate_request_data(<<"limits">>, Context, fun on_successful_validation/1).
 
 -spec post(cb_context:context()) -> cb_context:context().
-post(Context) -> crossbar_doc:save(Context).
+post(Context) ->
+    maybe_update_limits(Context).
 
 %%%===================================================================
 %%% Internal functions
@@ -136,17 +145,6 @@ post(Context) -> crossbar_doc:save(Context).
 -spec load_limit(cb_context:context()) -> cb_context:context().
 load_limit(Context) ->
     maybe_handle_load_failure(crossbar_doc:load(?PVT_TYPE, Context)).
-
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Update an existing device document with the data provided, if it is
-%% valid
-%% @end
-%%--------------------------------------------------------------------
--spec update_limits(cb_context:context()) -> cb_context:context().
-update_limits(Context) ->
-    cb_context:validate_request_data(<<"limits">>, Context, fun on_successful_validation/1).
 
 %%--------------------------------------------------------------------
 %% @private
@@ -186,3 +184,52 @@ maybe_handle_load_failure(Context, 404) ->
                          ,{fun cb_context:set_doc/2, crossbar_doc:update_pvt_parameters(JObj, Context)}
                         ]);
 maybe_handle_load_failure(Context, _RespCode) -> Context.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%%
+%% @end
+%%--------------------------------------------------------------------
+-spec maybe_update_limits(cb_context:context()) -> cb_context:context().
+maybe_update_limits(Context) ->
+    case not(cb_context:accepting_charges(Context)) of
+        'false' -> update_limits(Context);
+        'true' -> maybe_dry_run(Context)
+    end.
+
+-spec maybe_dry_run(cb_context:context()) -> cb_context:context().
+maybe_dry_run(Context) ->
+    RespJObj = dry_run(Context),
+    case wh_json:is_empty(RespJObj) of
+        'false' -> crossbar_util:response_402(RespJObj, Context);
+        'true' ->
+            NewReqJObj = wh_json:set_value(<<"accept_charges">>, <<"true">>, cb_context:req_json(Context)),
+            maybe_update_limits(cb_context:set_req_json(Context, NewReqJObj))
+    end.
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%%
+%% @end
+%%--------------------------------------------------------------------
+-spec update_limits(cb_context:context()) -> cb_context:context().
+update_limits(Context) ->
+    crossbar_doc:save(Context).
+
+%%--------------------------------------------------------------------
+%% @private
+%% @doc
+%%
+%% @end
+%%--------------------------------------------------------------------
+-spec dry_run(cb_context:context()) -> wh_json:object().
+dry_run(Context) ->
+    ReqData = cb_context:req_data(Context),
+    AccountId = cb_context:account_id(Context),
+    Updates = [{<<"limits">>, <<"twoway_trunks">>, wh_json:get_integer_value(<<"twoway_trunks">>, ReqData, 0)}
+               ,{<<"limits">>, <<"inbound_trunks">>, wh_json:get_integer_value(<<"inbound_trunks">>, ReqData, 0)}
+               ,{<<"limits">>, <<"outbound_trunks">>, wh_json:get_integer_value(<<"outbound_trunks">>, ReqData, 0)}
+              ],
+    wh_services:dry_run(AccountId, Updates).
