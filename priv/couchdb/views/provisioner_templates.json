@@ -1,5 +1,15 @@
 {
     "_id": "_design/provisioner_templates",
+    "kazoo": {
+        "view_map": [
+            {
+                "classification": "account"
+            },
+            {
+                "database": "global_provisioner"
+            }
+        ]
+    },
     "language": "javascript",
     "views": {
         "crossbar_listing": {
